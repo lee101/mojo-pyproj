@@ -1,0 +1,21 @@
+[project]
+name = "mojo-pyproj"
+version = "0.1.0"
+description = "Cartographic projection and datum-transform kernels implemented in Mojo"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+dev = ["pytest", "pyproj"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = { "" = "python" }
+
+[tool.setuptools.packages.find]
+where = ["python"]

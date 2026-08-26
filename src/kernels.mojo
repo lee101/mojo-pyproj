@@ -1,11 +1,10 @@
 """Projection and datum-transformation kernels exposed through a C ABI."""
 
-from std.algorithm import parallelize
 from std.ffi import external_call
 from std.math import atan2, cos, exp, pow, sin, sqrt, tan
 from std.sys.info import num_physical_cores, simd_width_of
 
-comptime Ptr = UnsafePointer[Float64, AnyOrigin[mut=True]]
+comptime Ptr = Pointer[Float64, AnyOrigin[mut=True]]
 comptime PI = 3.141592653589793238462643383279502884
 comptime DEG = PI / 180.0
 comptime RAD = 180.0 / PI
@@ -33,9 +32,8 @@ def workers_for(n: Int) -> Int:
 
 def helmert_workers_for(n: Int) -> Int:
     return (
-        min(n, min(num_physical_cores(), HELMERT_MAX_WORKERS))
-        if n >= HELMERT_PARALLEL_POINTS
-        else 1
+        min(n, min(num_physical_cores(), HELMERT_MAX_WORKERS)) if n
+        >= HELMERT_PARALLEL_POINTS else 1
     )
 
 
@@ -59,14 +57,18 @@ def meridional_arc(phi: Float64) -> Float64:
     var a8 = 315.0 / 512.0 * (n4 - 3.0 * n6 / 8.0)
     var a10 = 693.0 / 1280.0 * n5
     var a12 = 1001.0 / 2048.0 * n6
-    return A / (1.0 + n) * (
-        a0 * phi
-        - a2 * sin(2.0 * phi)
-        + a4 * sin(4.0 * phi)
-        - a6 * sin(6.0 * phi)
-        + a8 * sin(8.0 * phi)
-        - a10 * sin(10.0 * phi)
-        + a12 * sin(12.0 * phi)
+    return (
+        A
+        / (1.0 + n)
+        * (
+            a0 * phi
+            - a2 * sin(2.0 * phi)
+            + a4 * sin(4.0 * phi)
+            - a6 * sin(6.0 * phi)
+            + a8 * sin(8.0 * phi)
+            - a10 * sin(10.0 * phi)
+            + a12 * sin(12.0 * phi)
+        )
     )
 
 
@@ -85,24 +87,26 @@ def web_mercator(
     var oy = p(oy_addr)
     var workers = workers_for(n)
 
-    @parameter
+    @__parameter
     def process(worker: Int):
         var start = worker * n // workers
         var stop = (worker + 1) * n // workers
         for i in range(start, stop):
             if inverse == 0:
-                var phi = y[i] * DEG
+                var phi = y[unsafe_offset=i] * DEG
                 var s = sin(phi)
-                ox[i] = A * x[i] * DEG
-                oy[i] = 0.5 * A * precise_log((1.0 + s) / (1.0 - s))
+                ox[unsafe_offset=i] = A * x[unsafe_offset=i] * DEG
+                oy[unsafe_offset=i] = (
+                    0.5 * A * precise_log((1.0 + s) / (1.0 - s))
+                )
             else:
-                ox[i] = x[i] / A * RAD
-                oy[i] = (2.0 * atan2(exp(y[i] / A), 1.0) - PI * 0.5) * RAD
+                ox[unsafe_offset=i] = x[unsafe_offset=i] / A * RAD
+                oy[unsafe_offset=i] = (
+                    2.0 * atan2(exp(y[unsafe_offset=i] / A), 1.0) - PI * 0.5
+                ) * RAD
 
-    if workers > 1:
-        parallelize[process](workers, workers)
-    else:
-        process(0)
+    for worker in range(workers):
+        process(worker)
 
 
 @export("mpj_world_mercator")
@@ -121,25 +125,29 @@ def world_mercator(
     var workers = workers_for(n)
     var eccentricity = sqrt(E2)
 
-    @parameter
+    @__parameter
     def process(worker: Int):
         var start = worker * n // workers
         var stop = (worker + 1) * n // workers
         for i in range(start, stop):
             if inverse == 0:
-                var phi = y[i] * DEG
+                var phi = y[unsafe_offset=i] * DEG
                 var s = sin(phi)
-                ox[i] = A * x[i] * DEG
-                oy[i] = 0.5 * A * (
-                    precise_log((1.0 + s) / (1.0 - s))
-                    - eccentricity
-                    * precise_log(
-                        (1.0 + eccentricity * s) / (1.0 - eccentricity * s)
+                ox[unsafe_offset=i] = A * x[unsafe_offset=i] * DEG
+                oy[unsafe_offset=i] = (
+                    0.5
+                    * A
+                    * (
+                        precise_log((1.0 + s) / (1.0 - s))
+                        - eccentricity
+                        * precise_log(
+                            (1.0 + eccentricity * s) / (1.0 - eccentricity * s)
+                        )
                     )
                 )
             else:
-                ox[i] = x[i] / A * RAD
-                var t = exp(-y[i] / A)
+                ox[unsafe_offset=i] = x[unsafe_offset=i] / A * RAD
+                var t = exp(-y[unsafe_offset=i] / A)
                 var phi = PI * 0.5 - 2.0 * atan2(t, 1.0)
                 for _ in range(8):
                     var es = eccentricity * sin(phi)
@@ -147,12 +155,10 @@ def world_mercator(
                         t * pow((1.0 - es) / (1.0 + es), 0.5 * eccentricity),
                         1.0,
                     )
-                oy[i] = phi * RAD
+                oy[unsafe_offset=i] = phi * RAD
 
-    if workers > 1:
-        parallelize[process](workers, workers)
-    else:
-        process(0)
+    for worker in range(workers):
+        process(worker)
 
 
 @export("mpj_utm")
@@ -173,14 +179,14 @@ def utm(
     var workers = workers_for(n)
     var lon0 = (Float64(zone) * 6.0 - 183.0) * DEG
 
-    @parameter
+    @__parameter
     def process(worker: Int):
         var start = worker * n // workers
         var stop = (worker + 1) * n // workers
         for i in range(start, stop):
             if inverse == 0:
-                var lon = x[i] * DEG
-                var phi = y[i] * DEG
+                var lon = x[unsafe_offset=i] * DEG
+                var phi = y[unsafe_offset=i] * DEG
                 var sin_phi = sin(phi)
                 var cos_phi = cos(phi)
                 var tan_phi = tan(phi)
@@ -193,7 +199,7 @@ def utm(
                 var aa5 = aa4 * aa
                 var aa6 = aa3 * aa3
                 var nu = A / sqrt(1.0 - E2 * sin_phi * sin_phi)
-                ox[i] = 500000.0 + K0 * nu * (
+                ox[unsafe_offset=i] = 500000.0 + K0 * nu * (
                     aa
                     + (1.0 - tan2 + c) * aa3 / 6.0
                     + (5.0 - 18.0 * tan2 + tan2 * tan2 + 72.0 * c - 58.0 * EP2)
@@ -202,21 +208,30 @@ def utm(
                 )
                 var northing = K0 * (
                     meridional_arc(phi)
-                    + nu * tan_phi * (
+                    + nu
+                    * tan_phi
+                    * (
                         aa2 / 2.0
                         + (5.0 - tan2 + 9.0 * c + 4.0 * c * c) * aa4 / 24.0
                         + (
-                            61.0 - 58.0 * tan2 + tan2 * tan2 + 600.0 * c
+                            61.0
+                            - 58.0 * tan2
+                            + tan2 * tan2
+                            + 600.0 * c
                             - 330.0 * EP2
                         )
                         * aa6
                         / 720.0
                     )
                 )
-                oy[i] = northing + (10000000.0 if south != 0 else 0.0)
+                oy[unsafe_offset=i] = northing + (
+                    10000000.0 if south != 0 else 0.0
+                )
             else:
-                var east = x[i] - 500000.0
-                var north = y[i] - (10000000.0 if south != 0 else 0.0)
+                var east = x[unsafe_offset=i] - 500000.0
+                var north = y[unsafe_offset=i] - (
+                    10000000.0 if south != 0 else 0.0
+                )
                 var m = north / K0
                 var phi1 = m / A
                 for _ in range(5):
@@ -243,29 +258,39 @@ def utm(
                     * d4
                     / 24.0
                     + (
-                        61.0 + 90.0 * t1 + 298.0 * c1 + 45.0 * t1 * t1
-                        - 252.0 * EP2 - 3.0 * c1 * c1
+                        61.0
+                        + 90.0 * t1
+                        + 298.0 * c1
+                        + 45.0 * t1 * t1
+                        - 252.0 * EP2
+                        - 3.0 * c1 * c1
                     )
                     * d6
                     / 720.0
                 )
-                var lon = lon0 + (
-                    d
-                    - (1.0 + 2.0 * t1 + c1) * d3 / 6.0
+                var lon = (
+                    lon0
                     + (
-                        5.0 - 2.0 * c1 + 28.0 * t1 - 3.0 * c1 * c1
-                        + 8.0 * EP2 + 24.0 * t1 * t1
+                        d
+                        - (1.0 + 2.0 * t1 + c1) * d3 / 6.0
+                        + (
+                            5.0
+                            - 2.0 * c1
+                            + 28.0 * t1
+                            - 3.0 * c1 * c1
+                            + 8.0 * EP2
+                            + 24.0 * t1 * t1
+                        )
+                        * d5
+                        / 120.0
                     )
-                    * d5
-                    / 120.0
-                ) / cp
-                ox[i] = lon * RAD
-                oy[i] = lat * RAD
+                    / cp
+                )
+                ox[unsafe_offset=i] = lon * RAD
+                oy[unsafe_offset=i] = lat * RAD
 
-    if workers > 1:
-        parallelize[process](workers, workers)
-    else:
-        process(0)
+    for worker in range(workers):
+        process(worker)
 
 
 @export("mpj_geocentric")
@@ -287,24 +312,30 @@ def geocentric(
     var oz = p(oz_addr)
     var workers = workers_for(n)
 
-    @parameter
+    @__parameter
     def process(worker: Int):
         var start = worker * n // workers
         var stop = (worker + 1) * n // workers
         for i in range(start, stop):
             if inverse == 0:
-                var lon = x[i] * DEG
-                var lat = y[i] * DEG
+                var lon = x[unsafe_offset=i] * DEG
+                var lat = y[unsafe_offset=i] * DEG
                 var slat = sin(lat)
                 var clat = cos(lat)
                 var nu = A / sqrt(1.0 - E2 * slat * slat)
-                ox[i] = (nu + z[i]) * clat * cos(lon)
-                oy[i] = (nu + z[i]) * clat * sin(lon)
-                oz[i] = (nu * (1.0 - E2) + z[i]) * slat
+                ox[unsafe_offset=i] = (
+                    (nu + z[unsafe_offset=i]) * clat * cos(lon)
+                )
+                oy[unsafe_offset=i] = (
+                    (nu + z[unsafe_offset=i]) * clat * sin(lon)
+                )
+                oz[unsafe_offset=i] = (
+                    nu * (1.0 - E2) + z[unsafe_offset=i]
+                ) * slat
             else:
-                var xx = x[i]
-                var yy = y[i]
-                var zz = z[i]
+                var xx = x[unsafe_offset=i]
+                var yy = y[unsafe_offset=i]
+                var zz = z[unsafe_offset=i]
                 var radius = sqrt(xx * xx + yy * yy)
                 var theta = atan2(zz * A, radius * B)
                 var st = sin(theta)
@@ -325,14 +356,12 @@ def geocentric(
                 var final_sin = sin(lat)
                 var final_nu = A / sqrt(1.0 - E2 * final_sin * final_sin)
                 height = radius / cos(lat) - final_nu
-                ox[i] = atan2(yy, xx) * RAD
-                oy[i] = lat * RAD
-                oz[i] = height
+                ox[unsafe_offset=i] = atan2(yy, xx) * RAD
+                oy[unsafe_offset=i] = lat * RAD
+                oz[unsafe_offset=i] = height
 
-    if workers > 1:
-        parallelize[process](workers, workers)
-    else:
-        process(0)
+    for worker in range(workers):
+        process(worker)
 
 
 @export("mpj_helmert")
@@ -367,40 +396,50 @@ def helmert(
     var rz = convention_sign * rz_arcsec * arcsec
     var scale = 1.0 + scale_ppm * 1.0e-6
 
-    @parameter
+    @__parameter
     def process(worker: Int):
         var start = worker * n // workers
         var stop = (worker + 1) * n // workers
         var vector_stop = start + (stop - start) // W * W
         if inverse == 0:
             for i in range(start, vector_stop, W):
-                var xv = x.load[width=W](i)
-                var yv = y.load[width=W](i)
-                var zv = z.load[width=W](i)
-                ox.store(i, tx + scale * (xv - rz * yv + ry * zv))
-                oy.store(i, ty + scale * (rz * xv + yv - rx * zv))
-                oz.store(i, tz + scale * (-ry * xv + rx * yv + zv))
+                var xv = x.unsafe_load[width=W](i)
+                var yv = y.unsafe_load[width=W](i)
+                var zv = z.unsafe_load[width=W](i)
+                ox.unsafe_store(i, tx + scale * (xv - rz * yv + ry * zv))
+                oy.unsafe_store(i, ty + scale * (rz * xv + yv - rx * zv))
+                oz.unsafe_store(i, tz + scale * (-ry * xv + rx * yv + zv))
             for i in range(vector_stop, stop):
-                ox[i] = tx + scale * (x[i] - rz * y[i] + ry * z[i])
-                oy[i] = ty + scale * (rz * x[i] + y[i] - rx * z[i])
-                oz[i] = tz + scale * (-ry * x[i] + rx * y[i] + z[i])
+                ox[unsafe_offset=i] = tx + scale * (
+                    x[unsafe_offset=i]
+                    - rz * y[unsafe_offset=i]
+                    + ry * z[unsafe_offset=i]
+                )
+                oy[unsafe_offset=i] = ty + scale * (
+                    rz * x[unsafe_offset=i]
+                    + y[unsafe_offset=i]
+                    - rx * z[unsafe_offset=i]
+                )
+                oz[unsafe_offset=i] = tz + scale * (
+                    -ry * x[unsafe_offset=i]
+                    + rx * y[unsafe_offset=i]
+                    + z[unsafe_offset=i]
+                )
         else:
             for i in range(start, vector_stop, W):
-                var xx = (x.load[width=W](i) - tx) / scale
-                var yy = (y.load[width=W](i) - ty) / scale
-                var zz = (z.load[width=W](i) - tz) / scale
-                ox.store(i, xx + rz * yy - ry * zz)
-                oy.store(i, -rz * xx + yy + rx * zz)
-                oz.store(i, ry * xx - rx * yy + zz)
+                var xx = (x.unsafe_load[width=W](i) - tx) / scale
+                var yy = (y.unsafe_load[width=W](i) - ty) / scale
+                var zz = (z.unsafe_load[width=W](i) - tz) / scale
+                ox.unsafe_store(i, xx + rz * yy - ry * zz)
+                oy.unsafe_store(i, -rz * xx + yy + rx * zz)
+                oz.unsafe_store(i, ry * xx - rx * yy + zz)
             for i in range(vector_stop, stop):
-                var xx = (x[i] - tx) / scale
-                var yy = (y[i] - ty) / scale
-                var zz = (z[i] - tz) / scale
-                ox[i] = xx + rz * yy - ry * zz
-                oy[i] = -rz * xx + yy + rx * zz
-                oz[i] = ry * xx - rx * yy + zz
+                var xx = (x[unsafe_offset=i] - tx) / scale
+                var yy = (y[unsafe_offset=i] - ty) / scale
+                var zz = (z[unsafe_offset=i] - tz) / scale
+                ox[unsafe_offset=i] = xx + rz * yy - ry * zz
+                oy[unsafe_offset=i] = -rz * xx + yy + rx * zz
+                oz[unsafe_offset=i] = ry * xx - rx * yy + zz
 
-    if workers > 1:
-        parallelize[process](workers, workers)
-    else:
-        process(0)
+    for worker in range(workers):
+        process(worker)

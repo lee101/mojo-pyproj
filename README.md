@@ -84,19 +84,26 @@ x86_64. Runtime: Python 3.13.14, pyproj 3.7.2, PROJ 9.8.1.
 
 | Operation | mojo-pyproj | pyproj | Speedup | Result |
 |---|---:|---:|---:|:---|
-| Web Mercator forward | 26.65 ms | 148.26 ms | 5.56x | faster |
-| World Mercator forward | 29.26 ms | 204.60 ms | 6.99x | faster |
-| UTM zone 18N forward | 37.05 ms | 264.83 ms | 7.15x | faster |
-| UTM zone 18N inverse | 61.45 ms | 283.20 ms | 4.61x | faster |
-| WGS84 geographic to ECEF | 30.04 ms | 132.88 ms | 4.42x | faster |
-| WGS84 ECEF to geographic | 45.51 ms | 158.30 ms | 3.48x | faster |
-| UTM 18N to Web Mercator | 107.66 ms | 360.04 ms | 3.34x | faster |
-| 7-parameter Helmert | 14.87 ms | 57.25 ms | 3.85x | faster |
+| Web Mercator forward | 37.48 ms | 139.97 ms | 3.73x | faster |
+| World Mercator forward | 48.48 ms | 152.52 ms | 3.15x | faster |
+| UTM zone 18N forward | 27.61 ms | 252.31 ms | 9.14x | faster |
+| UTM zone 18N inverse | 87.89 ms | 276.89 ms | 3.15x | faster |
+| WGS84 geographic to ECEF | 18.40 ms | 141.39 ms | 7.68x | faster |
+| WGS84 ECEF to geographic | 31.14 ms | 159.17 ms | 5.11x | faster |
+| UTM 18N to Web Mercator | 103.28 ms | 360.31 ms | 3.49x | faster |
+| 7-parameter Helmert | 10.29 ms | 51.24 ms | 4.98x | faster |
 
-The advantage comes from splitting large independent coordinate arrays across
-the machine's physical cores. Small calls still pay roughly the normal ctypes
-call cost, so these results should not be read as a claim that every scalar call
-is faster than PROJ.
+The UTM and geocentric kernels split large independent coordinate arrays across
+the machine's physical cores. Mercator and Helmert remain serial because thread
+launch and contention costs outweighed their per-point work. Small calls still
+pay roughly the normal ctypes call cost, so these results should not be read as
+a claim that every scalar call is faster than PROJ.
+
+No GPU path is shipped. The inverse geocentric and UTM kernels have enough
+arithmetic intensity to be candidates, but the pinned Mojo toolchain cannot
+compile the required float64 trigonometric operations for NVIDIA GPUs. Using
+float32 would violate the existing pyproj parity tolerances, so CPU execution is
+kept rather than adding a GPU path that changes results.
 
 ## How it works
 
@@ -107,13 +114,13 @@ pyproj-style argument and result containers. It then supplies contiguous
 row-major NumPy `float64` buffers to the shared library through `ctypes`.
 
 Buffers cross the C ABI as integer addresses. Mojo reconstructs
-`UnsafePointer[Float64, AnyOrigin[mut=True]]` values inside non-parametric
+`Pointer[Float64, AnyOrigin[mut=True]]` values inside non-parametric
 `@export` functions, writes into caller-owned output buffers, and performs no
 FFI-side allocation. Projection operations with at least 65,536 coordinates are
-divided across physical cores; smaller arrays stay on one worker to avoid
-scheduling overhead. The lighter Helmert kernel uses SIMD with a scalar tail and
-starts up to eight workers at 262,144 coordinates. Composed
-projected-to-projected operations reuse Mojo-owned intermediate longitude and
+divided across physical cores for the arithmetic-heavy UTM and geocentric
+kernels; smaller arrays stay on one worker to avoid scheduling overhead. The
+geocentric inverse and Helmert kernels use SIMD with scalar tails. Composed
+projected-to-projected operations reuse caller-owned intermediate longitude and
 latitude buffers in place.
 
 The UTM implementation uses sixth-order transverse Mercator terms and a

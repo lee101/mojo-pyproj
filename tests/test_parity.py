@@ -140,6 +140,30 @@ def test_geocentric_random_array_parity():
     assert np.allclose(back[2], height, atol=5e-6, rtol=0)
 
 
+@pytest.mark.parametrize("size", [3, 5, 9, 17])
+def test_geocentric_inverse_simd_tail(size):
+    lon = np.linspace(-170.0, 170.0, size)
+    lat = np.linspace(-80.0, 80.0, size)
+    height = np.linspace(-100.0, 10_000.0, size)
+    ours, reference = pair(4979, 4978)
+    xyz = reference.transform(lon, lat, height)
+    actual = ours.transform(*xyz, direction="INVERSE")
+    expected = reference.transform(*xyz, direction="INVERSE")
+    assert np.allclose(actual[0], expected[0], atol=2e-12, rtol=0)
+    assert np.allclose(actual[1], expected[1], atol=4e-11, rtol=0)
+    assert np.allclose(actual[2], expected[2], atol=5e-6, rtol=0)
+
+
+@pytest.mark.parametrize("size", [65_535, 65_536])
+def test_projection_parallel_threshold(size):
+    lon = np.linspace(-77.0, -73.0, size)
+    lat = np.linspace(36.0, 44.0, size)
+    ours, reference = pair(4326, 32618)
+    actual = ours.transform(lon, lat)
+    expected = reference.transform(lon, lat)
+    assert np.allclose(actual, expected, atol=2e-4, rtol=0)
+
+
 def test_projection_to_projection_parity():
     lon = np.linspace(-77.5, -72.5, 1_000)
     lat = np.linspace(37.0, 44.0, 1_000)

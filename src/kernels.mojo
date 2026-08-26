@@ -1,5 +1,6 @@
 """Projection and datum-transformation kernels exposed through a C ABI."""
 
+from max.algorithm import parallelize
 from std.ffi import external_call
 from std.math import atan2, cos, exp, pow, sin, sqrt, tan
 from std.sys.info import num_physical_cores, simd_width_of
@@ -17,8 +18,6 @@ comptime B = A * (1.0 - F)
 comptime THIRD_FLATTENING = F / (2.0 - F)
 comptime K0 = 0.9996
 comptime PARALLEL_POINTS = 65536
-comptime HELMERT_PARALLEL_POINTS = 262144
-comptime HELMERT_MAX_WORKERS = 8
 comptime W = simd_width_of[DType.float64]()
 
 
@@ -28,13 +27,6 @@ def p(addr: Int) -> Ptr:
 
 def workers_for(n: Int) -> Int:
     return min(n, num_physical_cores()) if n >= PARALLEL_POINTS else 1
-
-
-def helmert_workers_for(n: Int) -> Int:
-    return (
-        min(n, min(num_physical_cores(), HELMERT_MAX_WORKERS)) if n
-        >= HELMERT_PARALLEL_POINTS else 1
-    )
 
 
 @always_inline
@@ -85,7 +77,7 @@ def web_mercator(
     var y = p(y_addr)
     var ox = p(ox_addr)
     var oy = p(oy_addr)
-    var workers = workers_for(n)
+    var workers = 1
 
     @__parameter
     def process(worker: Int):
@@ -105,8 +97,7 @@ def web_mercator(
                     2.0 * atan2(exp(y[unsafe_offset=i] / A), 1.0) - PI * 0.5
                 ) * RAD
 
-    for worker in range(workers):
-        process(worker)
+    process(0)
 
 
 @export("mpj_world_mercator")
@@ -122,7 +113,7 @@ def world_mercator(
     var y = p(y_addr)
     var ox = p(ox_addr)
     var oy = p(oy_addr)
-    var workers = workers_for(n)
+    var workers = 1
     var eccentricity = sqrt(E2)
 
     @__parameter
@@ -157,8 +148,7 @@ def world_mercator(
                     )
                 oy[unsafe_offset=i] = phi * RAD
 
-    for worker in range(workers):
-        process(worker)
+    process(0)
 
 
 @export("mpj_utm")
@@ -289,8 +279,10 @@ def utm(
                 ox[unsafe_offset=i] = lon * RAD
                 oy[unsafe_offset=i] = lat * RAD
 
-    for worker in range(workers):
-        process(worker)
+    if workers == 1:
+        process(0)
+    else:
+        parallelize[process](workers, workers)
 
 
 @export("mpj_geocentric")
@@ -316,8 +308,8 @@ def geocentric(
     def process(worker: Int):
         var start = worker * n // workers
         var stop = (worker + 1) * n // workers
-        for i in range(start, stop):
-            if inverse == 0:
+        if inverse == 0:
+            for i in range(start, stop):
                 var lon = x[unsafe_offset=i] * DEG
                 var lat = y[unsafe_offset=i] * DEG
                 var slat = sin(lat)
@@ -332,7 +324,36 @@ def geocentric(
                 oz[unsafe_offset=i] = (
                     nu * (1.0 - E2) + z[unsafe_offset=i]
                 ) * slat
-            else:
+        else:
+            var vector_stop = start + (stop - start) // W * W
+            for i in range(start, vector_stop, W):
+                var xx = x.unsafe_load[width=W](i)
+                var yy = y.unsafe_load[width=W](i)
+                var zz = z.unsafe_load[width=W](i)
+                var radius = sqrt(xx * xx + yy * yy)
+                var theta = atan2(zz * A, radius * B)
+                var st = sin(theta)
+                var ct = cos(theta)
+                var lat = atan2(
+                    zz + EP2 * B * st * st * st,
+                    radius - E2 * A * ct * ct * ct,
+                )
+                var height: SIMD[DType.float64, W]
+                for _ in range(3):
+                    var slat = sin(lat)
+                    var nu = A / sqrt(1.0 - E2 * slat * slat)
+                    height = radius / cos(lat) - nu
+                    lat = atan2(
+                        zz,
+                        radius * (1.0 - E2 * nu / (nu + height)),
+                    )
+                var final_sin = sin(lat)
+                var final_nu = A / sqrt(1.0 - E2 * final_sin * final_sin)
+                height = radius / cos(lat) - final_nu
+                ox.unsafe_store(i, atan2(yy, xx) * RAD)
+                oy.unsafe_store(i, lat * RAD)
+                oz.unsafe_store(i, height)
+            for i in range(vector_stop, stop):
                 var xx = x[unsafe_offset=i]
                 var yy = y[unsafe_offset=i]
                 var zz = z[unsafe_offset=i]
@@ -360,8 +381,10 @@ def geocentric(
                 oy[unsafe_offset=i] = lat * RAD
                 oz[unsafe_offset=i] = height
 
-    for worker in range(workers):
-        process(worker)
+    if workers == 1:
+        process(0)
+    else:
+        parallelize[process](workers, workers)
 
 
 @export("mpj_helmert")
@@ -389,7 +412,7 @@ def helmert(
     var ox = p(ox_addr)
     var oy = p(oy_addr)
     var oz = p(oz_addr)
-    var workers = helmert_workers_for(n)
+    var workers = 1
     var arcsec = DEG / 3600.0
     var rx = convention_sign * rx_arcsec * arcsec
     var ry = convention_sign * ry_arcsec * arcsec
@@ -441,5 +464,4 @@ def helmert(
                 oy[unsafe_offset=i] = -rz * xx + yy + rx * zz
                 oz[unsafe_offset=i] = ry * xx - rx * yy + zz
 
-    for worker in range(workers):
-        process(worker)
+    process(0)

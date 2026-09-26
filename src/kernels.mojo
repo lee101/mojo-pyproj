@@ -1,9 +1,8 @@
 """Projection and datum-transformation kernels exposed through a C ABI."""
 
-from max.algorithm import parallelize
 from std.ffi import external_call
 from std.math import atan2, cos, exp, pow, sin, sqrt, tan
-from std.sys.info import num_physical_cores, simd_width_of
+from std.sys.info import simd_width_of
 
 comptime Ptr = Pointer[Float64, AnyOrigin[mut=True]]
 comptime PI = 3.141592653589793238462643383279502884
@@ -17,16 +16,11 @@ comptime EP2 = E2 / (1.0 - E2)
 comptime B = A * (1.0 - F)
 comptime THIRD_FLATTENING = F / (2.0 - F)
 comptime K0 = 0.9996
-comptime PARALLEL_POINTS = 65536
 comptime W = simd_width_of[DType.float64]()
 
 
 def p(addr: Int) -> Ptr:
     return Ptr(unsafe_from_address=addr)
-
-
-def workers_for(n: Int) -> Int:
-    return min(n, num_physical_cores()) if n >= PARALLEL_POINTS else 1
 
 
 @always_inline
@@ -77,12 +71,8 @@ def web_mercator(
     var y = p(y_addr)
     var ox = p(ox_addr)
     var oy = p(oy_addr)
-    var workers = 1
-
-    @__parameter
-    def process(worker: Int):
-        var start = worker * n // workers
-        var stop = (worker + 1) * n // workers
+    @parameter
+    def process(start: Int, stop: Int):
         for i in range(start, stop):
             if inverse == 0:
                 var phi = y[unsafe_offset=i] * DEG
@@ -97,7 +87,7 @@ def web_mercator(
                     2.0 * atan2(exp(y[unsafe_offset=i] / A), 1.0) - PI * 0.5
                 ) * RAD
 
-    process(0)
+    process(0, n)
 
 
 @export("mpj_world_mercator")
@@ -113,13 +103,10 @@ def world_mercator(
     var y = p(y_addr)
     var ox = p(ox_addr)
     var oy = p(oy_addr)
-    var workers = 1
     var eccentricity = sqrt(E2)
 
-    @__parameter
-    def process(worker: Int):
-        var start = worker * n // workers
-        var stop = (worker + 1) * n // workers
+    @parameter
+    def process(start: Int, stop: Int):
         for i in range(start, stop):
             if inverse == 0:
                 var phi = y[unsafe_offset=i] * DEG
@@ -148,7 +135,131 @@ def world_mercator(
                     )
                 oy[unsafe_offset=i] = phi * RAD
 
-    process(0)
+    process(0, n)
+
+
+def utm_points(
+    x: Ptr,
+    y: Ptr,
+    ox: Ptr,
+    oy: Ptr,
+    n: Int,
+    zone: Int,
+    south: Int,
+    inverse: Int,
+    start: Int,
+    stop: Int,
+):
+    var lon0 = (Float64(zone) * 6.0 - 183.0) * DEG
+
+
+
+    for i in range(start, stop):
+        if inverse == 0:
+            var lon = x[unsafe_offset=i] * DEG
+            var phi = y[unsafe_offset=i] * DEG
+            var sin_phi = sin(phi)
+            var cos_phi = cos(phi)
+            var tan_phi = tan(phi)
+            var tan2 = tan_phi * tan_phi
+            var c = EP2 * cos_phi * cos_phi
+            var aa = cos_phi * (lon - lon0)
+            var aa2 = aa * aa
+            var aa3 = aa2 * aa
+            var aa4 = aa2 * aa2
+            var aa5 = aa4 * aa
+            var aa6 = aa3 * aa3
+            var nu = A / sqrt(1.0 - E2 * sin_phi * sin_phi)
+            ox[unsafe_offset=i] = 500000.0 + K0 * nu * (
+                aa
+                + (1.0 - tan2 + c) * aa3 / 6.0
+                + (5.0 - 18.0 * tan2 + tan2 * tan2 + 72.0 * c - 58.0 * EP2)
+                * aa5
+                / 120.0
+            )
+            var northing = K0 * (
+                meridional_arc(phi)
+                + nu
+                * tan_phi
+                * (
+                    aa2 / 2.0
+                    + (5.0 - tan2 + 9.0 * c + 4.0 * c * c) * aa4 / 24.0
+                    + (
+                        61.0
+                        - 58.0 * tan2
+                        + tan2 * tan2
+                        + 600.0 * c
+                        - 330.0 * EP2
+                    )
+                    * aa6
+                    / 720.0
+                )
+            )
+            oy[unsafe_offset=i] = northing + (
+                10000000.0 if south != 0 else 0.0
+            )
+        else:
+            var east = x[unsafe_offset=i] - 500000.0
+            var north = y[unsafe_offset=i] - (
+                10000000.0 if south != 0 else 0.0
+            )
+            var m = north / K0
+            var phi1 = m / A
+            for _ in range(5):
+                var foot_sin = sin(phi1)
+                var denom = 1.0 - E2 * foot_sin * foot_sin
+                var rho = A * (1.0 - E2) / pow(denom, 1.5)
+                phi1 += (m - meridional_arc(phi1)) / rho
+            var sp = sin(phi1)
+            var cp = cos(phi1)
+            var tp = tan(phi1)
+            var t1 = tp * tp
+            var c1 = EP2 * cp * cp
+            var n1 = A / sqrt(1.0 - E2 * sp * sp)
+            var r1 = A * (1.0 - E2) / pow(1.0 - E2 * sp * sp, 1.5)
+            var d = east / (n1 * K0)
+            var d2 = d * d
+            var d3 = d2 * d
+            var d4 = d2 * d2
+            var d5 = d4 * d
+            var d6 = d3 * d3
+            var lat = phi1 - (n1 * tp / r1) * (
+                d2 / 2.0
+                - (5.0 + 3.0 * t1 + 10.0 * c1 - 4.0 * c1 * c1 - 9.0 * EP2)
+                * d4
+                / 24.0
+                + (
+                    61.0
+                    + 90.0 * t1
+                    + 298.0 * c1
+                    + 45.0 * t1 * t1
+                    - 252.0 * EP2
+                    - 3.0 * c1 * c1
+                )
+                * d6
+                / 720.0
+            )
+            var lon = (
+                lon0
+                + (
+                    d
+                    - (1.0 + 2.0 * t1 + c1) * d3 / 6.0
+                    + (
+                        5.0
+                        - 2.0 * c1
+                        + 28.0 * t1
+                        - 3.0 * c1 * c1
+                        + 8.0 * EP2
+                        + 24.0 * t1 * t1
+                    )
+                    * d5
+                    / 120.0
+                )
+                / cp
+            )
+            ox[unsafe_offset=i] = lon * RAD
+            oy[unsafe_offset=i] = lat * RAD
+
 
 
 @export("mpj_utm")
@@ -162,127 +273,113 @@ def utm(
     south: Int,
     inverse: Int,
 ) abi("C"):
-    var x = p(x_addr)
-    var y = p(y_addr)
-    var ox = p(ox_addr)
-    var oy = p(oy_addr)
-    var workers = workers_for(n)
-    var lon0 = (Float64(zone) * 6.0 - 183.0) * DEG
+    utm_points(p(x_addr), p(y_addr), p(ox_addr), p(oy_addr), n, zone, south, inverse, 0, n)
 
-    @__parameter
-    def process(worker: Int):
-        var start = worker * n // workers
-        var stop = (worker + 1) * n // workers
+
+@export("mpj_utm_range")
+def utm_range(
+    x_addr: Int,
+    y_addr: Int,
+    ox_addr: Int,
+    oy_addr: Int,
+    n: Int,
+    zone: Int,
+    south: Int,
+    inverse: Int,
+    first: Int,
+    last: Int,
+) abi("C"):
+    utm_points(
+        p(x_addr), p(y_addr), p(ox_addr), p(oy_addr), n, zone, south, inverse,
+        first, last,
+    )
+
+
+def geocentric_points(
+    x: Ptr,
+    y: Ptr,
+    z: Ptr,
+    ox: Ptr,
+    oy: Ptr,
+    oz: Ptr,
+    n: Int,
+    inverse: Int,
+    start: Int,
+    stop: Int,
+):
+    if inverse == 0:
         for i in range(start, stop):
-            if inverse == 0:
-                var lon = x[unsafe_offset=i] * DEG
-                var phi = y[unsafe_offset=i] * DEG
-                var sin_phi = sin(phi)
-                var cos_phi = cos(phi)
-                var tan_phi = tan(phi)
-                var tan2 = tan_phi * tan_phi
-                var c = EP2 * cos_phi * cos_phi
-                var aa = cos_phi * (lon - lon0)
-                var aa2 = aa * aa
-                var aa3 = aa2 * aa
-                var aa4 = aa2 * aa2
-                var aa5 = aa4 * aa
-                var aa6 = aa3 * aa3
-                var nu = A / sqrt(1.0 - E2 * sin_phi * sin_phi)
-                ox[unsafe_offset=i] = 500000.0 + K0 * nu * (
-                    aa
-                    + (1.0 - tan2 + c) * aa3 / 6.0
-                    + (5.0 - 18.0 * tan2 + tan2 * tan2 + 72.0 * c - 58.0 * EP2)
-                    * aa5
-                    / 120.0
-                )
-                var northing = K0 * (
-                    meridional_arc(phi)
-                    + nu
-                    * tan_phi
-                    * (
-                        aa2 / 2.0
-                        + (5.0 - tan2 + 9.0 * c + 4.0 * c * c) * aa4 / 24.0
-                        + (
-                            61.0
-                            - 58.0 * tan2
-                            + tan2 * tan2
-                            + 600.0 * c
-                            - 330.0 * EP2
-                        )
-                        * aa6
-                        / 720.0
-                    )
-                )
-                oy[unsafe_offset=i] = northing + (
-                    10000000.0 if south != 0 else 0.0
-                )
-            else:
-                var east = x[unsafe_offset=i] - 500000.0
-                var north = y[unsafe_offset=i] - (
-                    10000000.0 if south != 0 else 0.0
-                )
-                var m = north / K0
-                var phi1 = m / A
-                for _ in range(5):
-                    var foot_sin = sin(phi1)
-                    var denom = 1.0 - E2 * foot_sin * foot_sin
-                    var rho = A * (1.0 - E2) / pow(denom, 1.5)
-                    phi1 += (m - meridional_arc(phi1)) / rho
-                var sp = sin(phi1)
-                var cp = cos(phi1)
-                var tp = tan(phi1)
-                var t1 = tp * tp
-                var c1 = EP2 * cp * cp
-                var n1 = A / sqrt(1.0 - E2 * sp * sp)
-                var r1 = A * (1.0 - E2) / pow(1.0 - E2 * sp * sp, 1.5)
-                var d = east / (n1 * K0)
-                var d2 = d * d
-                var d3 = d2 * d
-                var d4 = d2 * d2
-                var d5 = d4 * d
-                var d6 = d3 * d3
-                var lat = phi1 - (n1 * tp / r1) * (
-                    d2 / 2.0
-                    - (5.0 + 3.0 * t1 + 10.0 * c1 - 4.0 * c1 * c1 - 9.0 * EP2)
-                    * d4
-                    / 24.0
-                    + (
-                        61.0
-                        + 90.0 * t1
-                        + 298.0 * c1
-                        + 45.0 * t1 * t1
-                        - 252.0 * EP2
-                        - 3.0 * c1 * c1
-                    )
-                    * d6
-                    / 720.0
-                )
-                var lon = (
-                    lon0
-                    + (
-                        d
-                        - (1.0 + 2.0 * t1 + c1) * d3 / 6.0
-                        + (
-                            5.0
-                            - 2.0 * c1
-                            + 28.0 * t1
-                            - 3.0 * c1 * c1
-                            + 8.0 * EP2
-                            + 24.0 * t1 * t1
-                        )
-                        * d5
-                        / 120.0
-                    )
-                    / cp
-                )
-                ox[unsafe_offset=i] = lon * RAD
-                oy[unsafe_offset=i] = lat * RAD
-
-    if workers == 1:
-        process(0)
+            var lon = x[unsafe_offset=i] * DEG
+            var lat = y[unsafe_offset=i] * DEG
+            var slat = sin(lat)
+            var clat = cos(lat)
+            var nu = A / sqrt(1.0 - E2 * slat * slat)
+            ox[unsafe_offset=i] = (
+                (nu + z[unsafe_offset=i]) * clat * cos(lon)
+            )
+            oy[unsafe_offset=i] = (
+                (nu + z[unsafe_offset=i]) * clat * sin(lon)
+            )
+            oz[unsafe_offset=i] = (
+                nu * (1.0 - E2) + z[unsafe_offset=i]
+            ) * slat
     else:
-        parallelize[process](workers, workers)
+        var vector_stop = start + (stop - start) // W * W
+        for i in range(start, vector_stop, W):
+            var xx = x.unsafe_load[width=W](i)
+            var yy = y.unsafe_load[width=W](i)
+            var zz = z.unsafe_load[width=W](i)
+            var radius = sqrt(xx * xx + yy * yy)
+            var theta = atan2(zz * A, radius * B)
+            var st = sin(theta)
+            var ct = cos(theta)
+            var lat = atan2(
+                zz + EP2 * B * st * st * st,
+                radius - E2 * A * ct * ct * ct,
+            )
+            var height: SIMD[DType.float64, W]
+            for _ in range(3):
+                var slat = sin(lat)
+                var nu = A / sqrt(1.0 - E2 * slat * slat)
+                height = radius / cos(lat) - nu
+                lat = atan2(
+                    zz,
+                    radius * (1.0 - E2 * nu / (nu + height)),
+                )
+            var final_sin = sin(lat)
+            var final_nu = A / sqrt(1.0 - E2 * final_sin * final_sin)
+            height = radius / cos(lat) - final_nu
+            ox.unsafe_store(i, atan2(yy, xx) * RAD)
+            oy.unsafe_store(i, lat * RAD)
+            oz.unsafe_store(i, height)
+        for i in range(vector_stop, stop):
+            var xx = x[unsafe_offset=i]
+            var yy = y[unsafe_offset=i]
+            var zz = z[unsafe_offset=i]
+            var radius = sqrt(xx * xx + yy * yy)
+            var theta = atan2(zz * A, radius * B)
+            var st = sin(theta)
+            var ct = cos(theta)
+            var lat = atan2(
+                zz + EP2 * B * st * st * st,
+                radius - E2 * A * ct * ct * ct,
+            )
+            var height: Float64
+            for _ in range(3):
+                var slat = sin(lat)
+                var nu = A / sqrt(1.0 - E2 * slat * slat)
+                height = radius / cos(lat) - nu
+                lat = atan2(
+                    zz,
+                    radius * (1.0 - E2 * nu / (nu + height)),
+                )
+            var final_sin = sin(lat)
+            var final_nu = A / sqrt(1.0 - E2 * final_sin * final_sin)
+            height = radius / cos(lat) - final_nu
+            ox[unsafe_offset=i] = atan2(yy, xx) * RAD
+            oy[unsafe_offset=i] = lat * RAD
+            oz[unsafe_offset=i] = height
+
 
 
 @export("mpj_geocentric")
@@ -296,96 +393,29 @@ def geocentric(
     n: Int,
     inverse: Int,
 ) abi("C"):
-    var x = p(x_addr)
-    var y = p(y_addr)
-    var z = p(z_addr)
-    var ox = p(ox_addr)
-    var oy = p(oy_addr)
-    var oz = p(oz_addr)
-    var workers = workers_for(n)
+    geocentric_points(
+        p(x_addr), p(y_addr), p(z_addr), p(ox_addr), p(oy_addr), p(oz_addr),
+        n, inverse, 0, n,
+    )
 
-    @__parameter
-    def process(worker: Int):
-        var start = worker * n // workers
-        var stop = (worker + 1) * n // workers
-        if inverse == 0:
-            for i in range(start, stop):
-                var lon = x[unsafe_offset=i] * DEG
-                var lat = y[unsafe_offset=i] * DEG
-                var slat = sin(lat)
-                var clat = cos(lat)
-                var nu = A / sqrt(1.0 - E2 * slat * slat)
-                ox[unsafe_offset=i] = (
-                    (nu + z[unsafe_offset=i]) * clat * cos(lon)
-                )
-                oy[unsafe_offset=i] = (
-                    (nu + z[unsafe_offset=i]) * clat * sin(lon)
-                )
-                oz[unsafe_offset=i] = (
-                    nu * (1.0 - E2) + z[unsafe_offset=i]
-                ) * slat
-        else:
-            var vector_stop = start + (stop - start) // W * W
-            for i in range(start, vector_stop, W):
-                var xx = x.unsafe_load[width=W](i)
-                var yy = y.unsafe_load[width=W](i)
-                var zz = z.unsafe_load[width=W](i)
-                var radius = sqrt(xx * xx + yy * yy)
-                var theta = atan2(zz * A, radius * B)
-                var st = sin(theta)
-                var ct = cos(theta)
-                var lat = atan2(
-                    zz + EP2 * B * st * st * st,
-                    radius - E2 * A * ct * ct * ct,
-                )
-                var height: SIMD[DType.float64, W]
-                for _ in range(3):
-                    var slat = sin(lat)
-                    var nu = A / sqrt(1.0 - E2 * slat * slat)
-                    height = radius / cos(lat) - nu
-                    lat = atan2(
-                        zz,
-                        radius * (1.0 - E2 * nu / (nu + height)),
-                    )
-                var final_sin = sin(lat)
-                var final_nu = A / sqrt(1.0 - E2 * final_sin * final_sin)
-                height = radius / cos(lat) - final_nu
-                ox.unsafe_store(i, atan2(yy, xx) * RAD)
-                oy.unsafe_store(i, lat * RAD)
-                oz.unsafe_store(i, height)
-            for i in range(vector_stop, stop):
-                var xx = x[unsafe_offset=i]
-                var yy = y[unsafe_offset=i]
-                var zz = z[unsafe_offset=i]
-                var radius = sqrt(xx * xx + yy * yy)
-                var theta = atan2(zz * A, radius * B)
-                var st = sin(theta)
-                var ct = cos(theta)
-                var lat = atan2(
-                    zz + EP2 * B * st * st * st,
-                    radius - E2 * A * ct * ct * ct,
-                )
-                var height: Float64
-                for _ in range(3):
-                    var slat = sin(lat)
-                    var nu = A / sqrt(1.0 - E2 * slat * slat)
-                    height = radius / cos(lat) - nu
-                    lat = atan2(
-                        zz,
-                        radius * (1.0 - E2 * nu / (nu + height)),
-                    )
-                var final_sin = sin(lat)
-                var final_nu = A / sqrt(1.0 - E2 * final_sin * final_sin)
-                height = radius / cos(lat) - final_nu
-                ox[unsafe_offset=i] = atan2(yy, xx) * RAD
-                oy[unsafe_offset=i] = lat * RAD
-                oz[unsafe_offset=i] = height
 
-    if workers == 1:
-        process(0)
-    else:
-        parallelize[process](workers, workers)
-
+@export("mpj_geocentric_range")
+def geocentric_range(
+    x_addr: Int,
+    y_addr: Int,
+    z_addr: Int,
+    ox_addr: Int,
+    oy_addr: Int,
+    oz_addr: Int,
+    n: Int,
+    inverse: Int,
+    first: Int,
+    last: Int,
+) abi("C"):
+    geocentric_points(
+        p(x_addr), p(y_addr), p(z_addr), p(ox_addr), p(oy_addr), p(oz_addr),
+        n, inverse, first, last,
+    )
 
 @export("mpj_helmert")
 def helmert(
@@ -412,17 +442,15 @@ def helmert(
     var ox = p(ox_addr)
     var oy = p(oy_addr)
     var oz = p(oz_addr)
-    var workers = 1
+
     var arcsec = DEG / 3600.0
     var rx = convention_sign * rx_arcsec * arcsec
     var ry = convention_sign * ry_arcsec * arcsec
     var rz = convention_sign * rz_arcsec * arcsec
     var scale = 1.0 + scale_ppm * 1.0e-6
 
-    @__parameter
-    def process(worker: Int):
-        var start = worker * n // workers
-        var stop = (worker + 1) * n // workers
+    @parameter
+    def process(start: Int, stop: Int):
         var vector_stop = start + (stop - start) // W * W
         if inverse == 0:
             for i in range(start, vector_stop, W):
@@ -464,4 +492,4 @@ def helmert(
                 oy[unsafe_offset=i] = -rz * xx + yy + rx * zz
                 oz[unsafe_offset=i] = ry * xx - rx * yy + zz
 
-    process(0)
+    process(0, n)

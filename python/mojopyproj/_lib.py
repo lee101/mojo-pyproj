@@ -23,6 +23,8 @@ _SIGNATURES = {
     "mpj_utm": ([I, I, I, I, I, I, I, I], None),
     "mpj_geocentric": ([I, I, I, I, I, I, I, I], None),
     "mpj_helmert": ([I, I, I, I, I, I, I] + [F] * 8 + [I], None),
+    "mpj_utm_range": ([I] * 10, None),
+    "mpj_geocentric_range": ([I] * 10, None),
 }
 
 

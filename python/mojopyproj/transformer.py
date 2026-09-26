@@ -4,6 +4,8 @@ import math
 import shlex
 from typing import Iterable
 
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 
 from ._lib import addr, f64, lib
@@ -24,6 +26,23 @@ def _direction(value) -> TransformDirection:
         raise ProjError(f"invalid transform direction: {value!r}") from exc
 
 
+_THREAD_MIN_POINTS = 65536
+_THREAD_MAX_WORKERS = 8
+_RANGED = {"mpj_utm": "mpj_utm_range"}
+
+
+def _fan_out(name: str, n: int, head: tuple[int, ...]) -> None:
+    workers = min(_THREAD_MAX_WORKERS, n // _THREAD_MIN_POINTS or 1)
+    if workers < 2:
+        getattr(lib(), name)(*head)
+        return
+    step = -(-n // workers)
+    bounds = [(lo, min(lo + step, n)) for lo in range(0, n, step)]
+    fn = getattr(lib(), _RANGED[name])
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(lambda b: fn(*head, n, b[0], b[1]), bounds))
+
+
 def _call_xy(
     name: str, x: np.ndarray, y: np.ndarray, *args, reuse_input: bool = False
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -31,7 +50,11 @@ def _call_xy(
     oy = y if reuse_input else np.empty_like(y)
     if x.size == 0:
         return ox, oy
-    getattr(lib(), name)(addr(x), addr(y), addr(ox), addr(oy), x.size, *args)
+    head = (addr(x), addr(y), addr(ox), addr(oy), x.size, *args)
+    if name in _RANGED and x.size >= _THREAD_MIN_POINTS:
+        _fan_out(name, x.size, head)
+    else:
+        getattr(lib(), name)(*head)
     return ox, oy
 
 
@@ -43,9 +66,12 @@ def _geocentric(
     oz = np.empty_like(z)
     if x.size == 0:
         return ox, oy, oz
-    lib().mpj_geocentric(
-        addr(x), addr(y), addr(z), addr(ox), addr(oy), addr(oz), x.size, int(inverse)
-    )
+    head = (addr(x), addr(y), addr(z), addr(ox), addr(oy), addr(oz), x.size, int(inverse))
+    if x.size >= _THREAD_MIN_POINTS:
+        _RANGED["mpj_geocentric"] = "mpj_geocentric_range"
+        _fan_out("mpj_geocentric", x.size, head)
+    else:
+        lib().mpj_geocentric(*head)
     return ox, oy, oz
 
 
